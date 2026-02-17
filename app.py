@@ -83,6 +83,11 @@ MAX_IMAGE_RESOURCE_CHECKS = 3 if IS_RENDER else 12
 RESOURCE_CHECK_TIMEOUT = 4 if IS_RENDER else 8
 MAX_SIMILARITY_PAIRS = 2500 if IS_RENDER else 7000
 
+# Простая авторизация (можно переопределить в Render -> Environment)
+AUTH_USERNAME = os.getenv("SEO_AUDIT_USERNAME", "1")
+AUTH_PASSWORD = os.getenv("SEO_AUDIT_PASSWORD", "123")
+AUTH_TTL_SECONDS = int(os.getenv("SEO_AUDIT_AUTH_TTL_SECONDS", "1800"))  # 30 минут по умолчанию
+
 # URL patterns that often cause infinite crawl traps
 TRAP_PATTERNS = [
     r'/\?.*page=\d+',
@@ -370,6 +375,22 @@ class AuditRuntimeGuard:
 def get_runtime_guard() -> AuditRuntimeGuard:
     """Возвращает singleton-guard на процесс Streamlit."""
     return AuditRuntimeGuard()
+
+
+@dataclass
+class AuthSessionGuard:
+    """Эксклюзивная сессия: одновременно может быть авторизован только один пользователь."""
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    active_session_id: str = ""
+    active_username: str = ""
+    last_seen: float = 0.0
+
+
+@st.cache_resource(show_spinner=False)
+def get_auth_guard() -> AuthSessionGuard:
+    """Возвращает singleton-guard авторизации на процесс Streamlit."""
+    return AuthSessionGuard()
 
 
 # === DATA CLASSES ===
@@ -2948,6 +2969,8 @@ class SEOAuditApp:
             "scan_log": [],
             "scan_stats": {"progress": 0.0, "found": 0, "done": 0, "queue": 0, "errors": 0, "elapsed": 0.0},
             "session_id": str(uuid.uuid4()),
+            "is_authenticated": False,
+            "auth_error": "",
             "config": {
                 "url": "",
                 "max_pages": UI_DEFAULT_MAX_PAGES,
@@ -2962,7 +2985,13 @@ class SEOAuditApp:
                 st.session_state[key] = value
 
     def render(self) -> None:
+        self._sync_auth_state()
         self.render_sidebar()
+
+        if not st.session_state.get("is_authenticated", False):
+            self.render_login_screen()
+            return
+
         state = st.session_state["state"]
         if state == "IDLE":
             self.render_welcome_screen()
@@ -2973,6 +3002,73 @@ class SEOAuditApp:
         elif state == "ERROR":
             self.render_error_screen()
 
+    def _sync_auth_state(self) -> None:
+        """Обновляет статус авторизации и снимает блокировку по TTL."""
+        guard = get_auth_guard()
+        sid = st.session_state.get("session_id", "")
+        now = time.time()
+        with guard.lock:
+            if guard.active_session_id and (now - guard.last_seen) > AUTH_TTL_SECONDS:
+                guard.active_session_id = ""
+                guard.active_username = ""
+                guard.last_seen = 0.0
+
+            active_sid = guard.active_session_id
+
+        if st.session_state.get("is_authenticated", False):
+            if active_sid != sid:
+                st.session_state["is_authenticated"] = False
+            else:
+                with guard.lock:
+                    guard.last_seen = now
+
+    def _try_login(self, username: str, password: str) -> None:
+        """Пытается авторизовать текущую сессию. Авторизация эксклюзивная."""
+        username = (username or "").strip()
+        password = password or ""
+        if username != AUTH_USERNAME or password != AUTH_PASSWORD:
+            st.session_state["auth_error"] = "❌ Неверный логин или пароль."
+            return
+
+        guard = get_auth_guard()
+        sid = st.session_state.get("session_id", "")
+        now = time.time()
+        with guard.lock:
+            # TTL-safe: если предыдущая сессия "умерла", освобождаем слот.
+            if guard.active_session_id and (now - guard.last_seen) > AUTH_TTL_SECONDS:
+                guard.active_session_id = ""
+                guard.active_username = ""
+                guard.last_seen = 0.0
+
+            if guard.active_session_id and guard.active_session_id != sid:
+                st.session_state["auth_error"] = (
+                    "⏳ Профиль сейчас занят другим пользователем. Попробуйте позже."
+                )
+                return
+
+            guard.active_session_id = sid
+            guard.active_username = username
+            guard.last_seen = now
+
+        st.session_state["is_authenticated"] = True
+        st.session_state["auth_error"] = ""
+        st.rerun()
+
+    def _logout(self) -> None:
+        guard = get_auth_guard()
+        sid = st.session_state.get("session_id", "")
+        with guard.lock:
+            if guard.active_session_id == sid:
+                guard.active_session_id = ""
+                guard.active_username = ""
+                guard.last_seen = 0.0
+        st.session_state["is_authenticated"] = False
+        st.session_state["state"] = "IDLE"
+        st.session_state["results"] = None
+        st.session_state["error_message"] = ""
+        st.session_state["auth_error"] = ""
+        st.rerun()
+
     def render_sidebar(self) -> None:
         with st.sidebar:
             st.markdown("## 🔍 SEO Аудит-Машина")
@@ -2981,7 +3077,8 @@ class SEOAuditApp:
             cfg = st.session_state["config"]
             cfg["max_pages"] = max(10, min(int(cfg.get("max_pages", UI_DEFAULT_MAX_PAGES)), UI_MAX_PAGES_LIMIT))
             cfg["max_depth"] = max(1, min(int(cfg.get("max_depth", 5)), 10))
-            guard = get_runtime_guard()
+            audit_guard = get_runtime_guard()
+            auth_guard = get_auth_guard()
             url_value = st.text_input(
                 "Адрес сайта:",
                 value=cfg["url"],
@@ -2990,7 +3087,34 @@ class SEOAuditApp:
             )
             cfg["url"] = url_value.strip()
 
-            if guard.lock.locked() and guard.active_session_id and guard.active_session_id != st.session_state["session_id"]:
+            if not st.session_state.get("is_authenticated", False):
+                st.markdown("### 🔐 Вход")
+                username = st.text_input("Логин", key="auth_username", help="Логин для доступа к сервису.")
+                password = st.text_input("Пароль", type="password", key="auth_password", help="Пароль для доступа к сервису.")
+                if st.button("🔐 Войти", type="primary"):
+                    self._try_login(username, password)
+                err = st.session_state.get("auth_error", "")
+                if err:
+                    if "занят" in err:
+                        st.warning(err)
+                    else:
+                        st.error(err)
+
+                with auth_guard.lock:
+                    if auth_guard.active_session_id and auth_guard.active_session_id != st.session_state["session_id"]:
+                        idle_for = max(0, int(time.time() - auth_guard.last_seen))
+                        st.caption(f"Активная сессия другого пользователя • последняя активность: {idle_for} сек назад.")
+                st.markdown("---")
+                st.caption("v1.0 • Python + Streamlit")
+                return
+
+            with auth_guard.lock:
+                active_user = auth_guard.active_username or AUTH_USERNAME
+            st.success(f"👤 Вход выполнен: {active_user}")
+            if st.button("🚪 Выйти", use_container_width=True):
+                self._logout()
+
+            if audit_guard.lock.locked() and audit_guard.active_session_id and audit_guard.active_session_id != st.session_state["session_id"]:
                 st.info("⏳ Сейчас выполняется аудит другим пользователем. Запуск временно недоступен.")
 
             if st.button("🚀 Запустить аудит", type="primary"):
@@ -3080,6 +3204,11 @@ class SEOAuditApp:
 
     def start_scan(self) -> None:
         cfg = st.session_state["config"]
+        if not st.session_state.get("is_authenticated", False):
+            st.session_state["state"] = "ERROR"
+            st.session_state["error_message"] = "❌ Требуется авторизация."
+            st.rerun()
+
         guard = get_runtime_guard()
         session_id = st.session_state["session_id"]
         if guard.lock.locked() and guard.active_session_id and guard.active_session_id != session_id:
@@ -3154,6 +3283,27 @@ class SEOAuditApp:
                     """,
                     unsafe_allow_html=True,
                 )
+
+    def render_login_screen(self) -> None:
+        st.markdown(
+            """
+            <div style="text-align:center; padding: 24px 0 12px;">
+                <h1 style="margin-bottom: 6px;">🔐 Доступ к SEO Аудит-Машине</h1>
+                <p style="color:#94A3B8; font-size:16px;">
+                    Введите логин и пароль в боковой панели слева.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            """
+            <div style="background:#1E293B; border:1px solid #334155; border-radius:12px; padding:14px; text-align:center; margin-bottom:18px;">
+                Если профиль занят — подождите, пока текущий пользователь выйдет или сессия истечёт по таймауту.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     def render_scanning_screen(self) -> None:
         cfg = st.session_state["config"]
