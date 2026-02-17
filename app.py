@@ -11,10 +11,13 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
 import socket
 import ssl
+import threading
 import time
+import uuid
 from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -64,9 +67,18 @@ VERY_THIN_CONTENT_THRESHOLD = 100
 TEXT_HTML_RATIO_LOW = 10
 TTFB_WARNING = 1.5
 TTFB_CRITICAL = 3.0
-MAX_HTML_SIZE = 5 * 1024 * 1024  # 5MB
 MAX_REDIRECTS = 5
 LARGE_IMAGE_BYTES = 500 * 1024  # 500KB
+
+IS_RENDER = os.getenv("RENDER", "").lower() == "true" or bool(os.getenv("RENDER_SERVICE_ID"))
+MAX_WORKERS = 3 if IS_RENDER else 5
+MAX_HTML_SIZE = 2 * 1024 * 1024 if IS_RENDER else 5 * 1024 * 1024  # bytes
+MAX_STORED_HTML_CHARS = 120000
+MAX_CONTENT_TEXT_CHARS = 12000
+MAX_EXTERNAL_CHECKS = 200 if IS_RENDER else 400
+MAX_UNCRAWLED_STATUS_CHECKS = 250 if IS_RENDER else 500
+UI_MAX_PAGES_LIMIT = 120 if IS_RENDER else 200
+UI_DEFAULT_MAX_PAGES = 40 if IS_RENDER else 50
 
 # URL patterns that often cause infinite crawl traps
 TRAP_PATTERNS = [
@@ -234,6 +246,7 @@ ERROR_MESSAGES_RU = {
     "cloudflare": "Обнаружена защита Cloudflare. Инструмент не может пройти проверку.",
     "no_pages": "Не удалось найти внутренние страницы. Сайт может использовать JS-навигацию.",
     "empty_response": "Сайт вернул пустой ответ. Проверьте, открывается ли он в браузере.",
+    "busy": "Сервис сейчас выполняет другой аудит. Подождите завершения и запустите снова.",
 }
 
 # JS framework detection patterns
@@ -339,6 +352,21 @@ if not any(isinstance(h, BufferLogHandler) for h in logger.handlers):
     logger.addHandler(mem_handler)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+@dataclass
+class AuditRuntimeGuard:
+    """Глобальная блокировка, чтобы не запускать несколько тяжёлых аудитов одновременно."""
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    active_session_id: str = ""
+    started_at: float = 0.0
+
+
+@st.cache_resource(show_spinner=False)
+def get_runtime_guard() -> AuditRuntimeGuard:
+    """Возвращает singleton-guard на процесс Streamlit."""
+    return AuditRuntimeGuard()
 
 
 # === DATA CLASSES ===
@@ -483,7 +511,6 @@ class PageResult:
             "hasLang": self.has_lang,
             "langValue": self.lang_value,
             "hasHreflang": self.has_hreflang,
-            "rawHtml": self.raw_html[:200000],
             "canonicalAbsolute": self.canonical_absolute,
             "canonicalTargetStatus": self.canonical_target_status,
             "jsRenderWarning": self.js_render_warning,
@@ -571,6 +598,7 @@ class CrawlerEngine:
         self.crawl_delay = crawl_delay
         self.respect_robots = respect_robots
         self.check_external = check_external
+        self.max_workers = MAX_WORKERS
 
         self.visited: Set[str] = set()
         self.queue: List[Tuple[str, int]] = []
@@ -593,7 +621,8 @@ class CrawlerEngine:
             allowed_methods=frozenset(["GET", "HEAD"]),
             raise_on_status=False,
         )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+        pool_size = max(10, self.max_workers * 4)
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=pool_size, pool_maxsize=pool_size)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
@@ -916,14 +945,14 @@ class CrawlerEngine:
         while self.queue and len(self.results) < self.max_pages and not self._stop_flag:
             # Take batch from queue
             batch = []
-            while self.queue and len(batch) < 5 and (len(self.results) + len(batch)) < self.max_pages:
+            while self.queue and len(batch) < self.max_workers and (len(self.results) + len(batch)) < self.max_pages:
                 batch.append(self.queue.pop(0))
 
             if not batch:
                 break
 
             # Process batch in parallel
-            with ThreadPoolExecutor(max_workers=5) as executor:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = {}
                 for url, depth in batch:
                     futures[executor.submit(self._fetch_and_analyze, url, depth)] = (url, depth)
@@ -1053,6 +1082,11 @@ class CrawlerEngine:
         scorer.calculate_scores()
         scorer.generate_recommendations()
 
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
         return result
 
     def stop(self):
@@ -1106,7 +1140,7 @@ class CrawlerEngine:
         if not unresolved:
             return status_map
 
-        for url in list(unresolved)[:500]:
+        for url in list(unresolved)[:MAX_UNCRAWLED_STATUS_CHECKS]:
             status_map[url] = self._fetch_url_status(url, timeout=8)
         return status_map
 
@@ -1146,7 +1180,7 @@ class CrawlerEngine:
 
     def _check_external_links(self, progress_callback=None) -> Dict[str, int]:
         """Проверяет внешние ссылки (если опция включена)."""
-        external_urls = list(self.external_links_found)[:400]
+        external_urls = list(self.external_links_found)[:MAX_EXTERNAL_CHECKS]
         status_map: Dict[str, int] = {}
         if not external_urls:
             return status_map
@@ -1154,7 +1188,7 @@ class CrawlerEngine:
         if progress_callback:
             progress_callback({"type": "pre_check", "message": "Проверка внешних ссылок..."})
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {executor.submit(self._fetch_url_status, url, 8): url for url in external_urls}
             for future in as_completed(futures):
                 status_map[futures[future]] = future.result()
@@ -1170,7 +1204,7 @@ class CrawlerEngine:
             resp = self.session.get(
                 url, timeout=15, allow_redirects=True, verify=True,
                 headers=self._request_headers(),
-                stream=False,
+                stream=True,
             )
         except requests.exceptions.SSLError:
             try:
@@ -1180,6 +1214,7 @@ class CrawlerEngine:
                     allow_redirects=True,
                     verify=False,
                     headers=self._request_headers(),
+                    stream=True,
                 )
             except Exception as e:
                 result.error_message = f"SSL + fallback error: {str(e)[:100]}"
@@ -1215,9 +1250,49 @@ class CrawlerEngine:
         result.status_code = resp.status_code
         result.ttfb = resp.elapsed.total_seconds()
         result.content_type = resp.headers.get("Content-Type", "")
-        result.content_length = len(resp.content)
         result.response_headers = {k: v for k, v in resp.headers.items()}
-        result.raw_html = (resp.text or "")[:MAX_HTML_SIZE]
+        if "text/html" not in result.content_type.lower():
+            result.issues.append(PageIssue(
+                "warning",
+                "technical",
+                "non_html_content",
+                "Контент страницы не text/html",
+                result.content_type or "unknown",
+                "text/html",
+            ))
+            try:
+                resp.close()
+            except Exception:
+                pass
+            return result, [], []
+
+        raw_chunks: List[bytes] = []
+        loaded_size = 0
+        too_large = False
+        content_len_header = resp.headers.get("Content-Length", "").strip()
+        declared_size = int(content_len_header) if content_len_header.isdigit() else 0
+        if declared_size > MAX_HTML_SIZE:
+            too_large = True
+        else:
+            try:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    loaded_size += len(chunk)
+                    if loaded_size > MAX_HTML_SIZE:
+                        too_large = True
+                        break
+                    raw_chunks.append(chunk)
+            except Exception:
+                pass
+
+        raw_bytes = b"".join(raw_chunks)
+        result.content_length = len(raw_bytes) if raw_bytes else declared_size
+
+        try:
+            resp.close()
+        except Exception:
+            pass
 
         if result.content_length == 0:
             result.issues.append(PageIssue(
@@ -1229,6 +1304,27 @@ class CrawlerEngine:
                 ">0 байт",
             ))
             return result, [], []
+        if too_large:
+            page_kb = max(result.content_length, declared_size) // 1024
+            result.issues.append(PageIssue(
+                "warning",
+                "technical",
+                "large_page",
+                f"Слишком большая HTML-страница: {page_kb}KB",
+                f"{page_kb}KB",
+                f"<{MAX_HTML_SIZE // 1024}KB",
+            ))
+            return result, [], []
+
+        try:
+            encoding = resp.encoding or "utf-8"
+            html_text = raw_bytes.decode(encoding, errors="replace")
+        except (LookupError, UnicodeDecodeError):
+            html_text = raw_bytes.decode("utf-8", errors="replace")
+        result.raw_html = html_text[:MAX_STORED_HTML_CHARS]
+        # Используем уже загруженный буфер, чтобы анализатор не перечитывал тело ответа.
+        resp._content = raw_bytes
+
         if result.status_code in (403, 429):
             result.issues.append(PageIssue(
                 "warning",
@@ -1238,7 +1334,7 @@ class CrawlerEngine:
                 str(result.status_code),
                 "200",
             ))
-        body_preview = (resp.text or "")[:2500].lower()
+        body_preview = html_text[:2500].lower()
         if "cloudflare" in body_preview and ("attention required" in body_preview or "cf-challenge" in body_preview):
             result.issues.append(PageIssue(
                 "warning",
@@ -1277,30 +1373,11 @@ class CrawlerEngine:
                     "X-Robots-Tag содержит nofollow",
                 ))
 
-        # Skip non-HTML
-        if "text/html" not in result.content_type:
-            result.issues.append(PageIssue(
-                "warning",
-                "technical",
-                "non_html_content",
-                "Контент страницы не text/html",
-                result.content_type or "unknown",
-                "text/html",
-            ))
-            return result, [], []
-
-        # Size guard
-        if result.content_length > MAX_HTML_SIZE:
-            result.issues.append(PageIssue("warning", "technical", "large_page",
-                f"Слишком большая HTML-страница: {result.content_length // 1024}KB",
-                f"{result.content_length // 1024}KB", "<1MB"))
-            return result, [], []
-
         # Parse HTML
         try:
-            soup = BeautifulSoup(resp.content, "lxml")
+            soup = BeautifulSoup(raw_bytes, "lxml")
         except Exception:
-            soup = BeautifulSoup(resp.content, "html.parser")
+            soup = BeautifulSoup(raw_bytes, "html.parser")
 
         # Run all per-page checks
         page_analyzer = PageAnalyzer(url, resp, soup, result, self.domain, self.base_origin, self.session, self._request_headers)
@@ -1582,7 +1659,7 @@ class PageAnalyzer:
         text = clean_soup.get_text(separator=" ", strip=True)
         words = text.split()
         self.r.word_count = len(words)
-        self.r.content_text = re.sub(r"\s+", " ", text).strip()[:20000]
+        self.r.content_text = re.sub(r"\s+", " ", text).strip()[:MAX_CONTENT_TEXT_CHARS]
 
         # Content hash
         clean_text = re.sub(r"\s+", " ", text.lower().strip())
@@ -2818,9 +2895,10 @@ class SEOAuditApp:
             "error_message": "",
             "scan_log": [],
             "scan_stats": {"progress": 0.0, "found": 0, "done": 0, "queue": 0, "errors": 0, "elapsed": 0.0},
+            "session_id": str(uuid.uuid4()),
             "config": {
                 "url": "",
-                "max_pages": 50,
+                "max_pages": UI_DEFAULT_MAX_PAGES,
                 "max_depth": 5,
                 "crawl_delay": 0.3,
                 "respect_robots": True,
@@ -2849,6 +2927,9 @@ class SEOAuditApp:
             st.markdown("---")
 
             cfg = st.session_state["config"]
+            cfg["max_pages"] = max(10, min(int(cfg.get("max_pages", UI_DEFAULT_MAX_PAGES)), UI_MAX_PAGES_LIMIT))
+            cfg["max_depth"] = max(1, min(int(cfg.get("max_depth", 5)), 10))
+            guard = get_runtime_guard()
             url_value = st.text_input(
                 "Адрес сайта:",
                 value=cfg["url"],
@@ -2857,6 +2938,9 @@ class SEOAuditApp:
             )
             cfg["url"] = url_value.strip()
 
+            if guard.lock.locked() and guard.active_session_id and guard.active_session_id != st.session_state["session_id"]:
+                st.info("⏳ Сейчас выполняется аудит другим пользователем. Запуск временно недоступен.")
+
             if st.button("🚀 Запустить аудит", type="primary"):
                 self.start_scan()
 
@@ -2864,7 +2948,7 @@ class SEOAuditApp:
                 cfg["max_pages"] = st.slider(
                     "Макс. страниц",
                     10,
-                    200,
+                    UI_MAX_PAGES_LIMIT,
                     int(cfg["max_pages"]),
                     help="Сколько страниц просканировать. Для малого сайта обычно достаточно 50.",
                 )
@@ -2893,6 +2977,11 @@ class SEOAuditApp:
                     value=bool(cfg["check_external"]),
                     help="Дополнительно проверяет внешние URL на 4xx/5xx.",
                 )
+                if IS_RENDER:
+                    st.caption(
+                        f"⚙️ Облачный режим: макс. {UI_MAX_PAGES_LIMIT} страниц и до {MAX_WORKERS} параллельных потоков "
+                        "для стабильной работы."
+                    )
 
             if st.session_state["state"] == "SCANNING":
                 stats = st.session_state["scan_stats"]
@@ -2939,6 +3028,13 @@ class SEOAuditApp:
 
     def start_scan(self) -> None:
         cfg = st.session_state["config"]
+        guard = get_runtime_guard()
+        session_id = st.session_state["session_id"]
+        if guard.lock.locked() and guard.active_session_id and guard.active_session_id != session_id:
+            st.session_state["state"] = "ERROR"
+            st.session_state["error_message"] = ERROR_MESSAGES_RU["busy"]
+            st.rerun()
+
         raw_url = cfg["url"].strip()
         if not raw_url:
             st.session_state["state"] = "ERROR"
@@ -2955,6 +3051,10 @@ class SEOAuditApp:
             st.session_state["error_message"] = ERROR_MESSAGES_RU["invalid_url"]
             st.rerun()
 
+        cfg["max_pages"] = max(10, min(int(cfg.get("max_pages", UI_DEFAULT_MAX_PAGES)), UI_MAX_PAGES_LIMIT))
+
+        build_pages_dataframe.clear()
+        build_issues_dataframe.clear()
         st.session_state["scan_log"] = []
         st.session_state["scan_stats"] = {"progress": 0.0, "found": 0, "done": 0, "queue": 0, "errors": 0, "elapsed": 0.0}
         st.session_state["results"] = None
@@ -3059,7 +3159,23 @@ class SEOAuditApp:
             log_html += "</div>"
             log_container.markdown(log_html, unsafe_allow_html=True)
 
+        guard = get_runtime_guard()
+        session_id = st.session_state["session_id"]
+        if guard.lock.locked() and guard.active_session_id and guard.active_session_id != session_id:
+            st.session_state["state"] = "ERROR"
+            st.session_state["error_message"] = ERROR_MESSAGES_RU["busy"]
+            st.rerun()
+
+        lock_acquired = False
         try:
+            lock_acquired = guard.lock.acquire(blocking=False)
+            if not lock_acquired and guard.active_session_id and guard.active_session_id != session_id:
+                st.session_state["state"] = "ERROR"
+                st.session_state["error_message"] = ERROR_MESSAGES_RU["busy"]
+                st.rerun()
+
+            guard.active_session_id = session_id
+            guard.started_at = time.time()
             crawler = CrawlerEngine(
                 start_url=cfg["url"],
                 max_pages=int(cfg["max_pages"]),
@@ -3088,6 +3204,11 @@ class SEOAuditApp:
             logger.exception("Ошибка сканирования")
             st.session_state["state"] = "ERROR"
             st.session_state["error_message"] = f"❌ Ошибка аудита: {str(exc)[:180]}"
+        finally:
+            if lock_acquired:
+                guard.active_session_id = ""
+                guard.started_at = 0.0
+                guard.lock.release()
 
         st.rerun()
 
