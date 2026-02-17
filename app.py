@@ -3079,13 +3079,6 @@ class SEOAuditApp:
             cfg["max_depth"] = max(1, min(int(cfg.get("max_depth", 5)), 10))
             audit_guard = get_runtime_guard()
             auth_guard = get_auth_guard()
-            url_value = st.text_input(
-                "Адрес сайта:",
-                value=cfg["url"],
-                placeholder="https://example.com",
-                help="Введите полный URL сайта для аудита.",
-            )
-            cfg["url"] = url_value.strip()
 
             if not st.session_state.get("is_authenticated", False):
                 st.markdown("### 🔐 Вход")
@@ -3113,6 +3106,14 @@ class SEOAuditApp:
             st.success(f"👤 Вход выполнен: {active_user}")
             if st.button("🚪 Выйти", use_container_width=True):
                 self._logout()
+
+            url_value = st.text_input(
+                "Адрес сайта:",
+                value=cfg["url"],
+                placeholder="https://example.com",
+                help="Введите полный URL сайта для аудита.",
+            )
+            cfg["url"] = url_value.strip()
 
             if audit_guard.lock.locked() and audit_guard.active_session_id and audit_guard.active_session_id != st.session_state["session_id"]:
                 st.info("⏳ Сейчас выполняется аудит другим пользователем. Запуск временно недоступен.")
