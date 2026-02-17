@@ -79,6 +79,9 @@ MAX_EXTERNAL_CHECKS = 200 if IS_RENDER else 400
 MAX_UNCRAWLED_STATUS_CHECKS = 250 if IS_RENDER else 500
 UI_MAX_PAGES_LIMIT = 120 if IS_RENDER else 200
 UI_DEFAULT_MAX_PAGES = 40 if IS_RENDER else 50
+MAX_IMAGE_RESOURCE_CHECKS = 3 if IS_RENDER else 12
+RESOURCE_CHECK_TIMEOUT = 4 if IS_RENDER else 8
+MAX_SIMILARITY_PAIRS = 2500 if IS_RENDER else 7000
 
 # URL patterns that often cause infinite crawl traps
 TRAP_PATTERNS = [
@@ -610,6 +613,8 @@ class CrawlerEngine:
             lambda: {"internal": set(), "external": set(), "blocked": set()}
         )
         self.raw_url_variants: Dict[str, Set[str]] = defaultdict(set)
+        self.resource_info_cache: Dict[str, Tuple[int, int]] = {}
+        self.resource_cache_lock = threading.Lock()
 
         self.session = requests.Session()
         retry = Retry(
@@ -962,7 +967,7 @@ class CrawlerEngine:
                     try:
                         page_result, discovered_internal, discovered_external = future.result()
                         if page_result:
-                            source_key = self.normalize_url(url)
+                            source_key = self.normalize_url(page_result.url or url)
                             page_result.url = source_key
                             self.results[source_key] = page_result
 
@@ -1380,7 +1385,18 @@ class CrawlerEngine:
             soup = BeautifulSoup(raw_bytes, "html.parser")
 
         # Run all per-page checks
-        page_analyzer = PageAnalyzer(url, resp, soup, result, self.domain, self.base_origin, self.session, self._request_headers)
+        page_analyzer = PageAnalyzer(
+            result.url,
+            resp,
+            soup,
+            result,
+            self.domain,
+            self.base_origin,
+            self.session,
+            self._request_headers,
+            self.resource_info_cache,
+            self.resource_cache_lock,
+        )
         page_analyzer.analyze_all()
 
         # Extract links for crawler
@@ -1398,7 +1414,9 @@ class PageAnalyzer:
 
     def __init__(self, url: str, response: requests.Response, soup: BeautifulSoup,
                  result: PageResult, domain: str, base_origin: str,
-                 session: requests.Session, headers_factory):
+                 session: requests.Session, headers_factory,
+                 resource_info_cache: Dict[str, Tuple[int, int]],
+                 resource_cache_lock: threading.Lock):
         self.url = url
         self.response = response
         self.soup = soup
@@ -1407,6 +1425,8 @@ class PageAnalyzer:
         self.base_origin = base_origin
         self.session = session
         self.headers_factory = headers_factory
+        self.resource_info_cache = resource_info_cache
+        self.resource_cache_lock = resource_cache_lock
 
     def add_issue(self, severity: str, category: str, code: str, message: str,
                   current: str = "", expected: str = ""):
@@ -1459,43 +1479,55 @@ class PageAnalyzer:
 
     def _fetch_resource_info(self, resource_url: str) -> Tuple[int, int]:
         """Возвращает код ответа и размер ресурса (байты)."""
+        cache_key = resource_url.split("#", 1)[0]
+        with self.resource_cache_lock:
+            cached = self.resource_info_cache.get(cache_key)
+        if cached:
+            return cached
+
+        status_size: Tuple[int, int] = (0, 0)
         try:
             head = self.session.head(
-                resource_url,
-                timeout=8,
+                cache_key,
+                timeout=RESOURCE_CHECK_TIMEOUT,
                 allow_redirects=True,
                 verify=True,
                 headers=self.headers_factory(),
             )
             size = int(head.headers.get("Content-Length", "0") or "0")
             if head.status_code == 405:
-                get_resp = self.session.get(
-                    resource_url,
-                    timeout=8,
+                with self.session.get(
+                    cache_key,
+                    timeout=RESOURCE_CHECK_TIMEOUT,
                     allow_redirects=True,
                     verify=True,
                     headers=self.headers_factory(),
                     stream=True,
-                )
-                size = int(get_resp.headers.get("Content-Length", "0") or "0")
-                return get_resp.status_code, size
-            return head.status_code, size
+                ) as get_resp:
+                    size = int(get_resp.headers.get("Content-Length", "0") or "0")
+                    status_size = (get_resp.status_code, size)
+            else:
+                status_size = (head.status_code, size)
         except requests.exceptions.SSLError:
             try:
-                get_resp = self.session.get(
-                    resource_url,
-                    timeout=8,
+                with self.session.get(
+                    cache_key,
+                    timeout=RESOURCE_CHECK_TIMEOUT,
                     allow_redirects=True,
                     verify=False,
                     headers=self.headers_factory(),
                     stream=True,
-                )
-                size = int(get_resp.headers.get("Content-Length", "0") or "0")
-                return get_resp.status_code, size
+                ) as get_resp:
+                    size = int(get_resp.headers.get("Content-Length", "0") or "0")
+                    status_size = (get_resp.status_code, size)
             except Exception:
-                return 0, 0
+                status_size = (0, 0)
         except Exception:
-            return 0, 0
+            status_size = (0, 0)
+
+        with self.resource_cache_lock:
+            self.resource_info_cache[cache_key] = status_size
+        return status_size
 
     # --- Individual checks ---
 
@@ -1738,13 +1770,7 @@ class PageAnalyzer:
             self.r.canonical_status = "ok"
 
     def _check_images(self):
-        # Re-parse from original response for images (content was decomposed above)
-        try:
-            img_soup = BeautifulSoup(self.response.content, "lxml")
-        except Exception:
-            img_soup = BeautifulSoup(self.response.content, "html.parser")
-
-        images = img_soup.find_all("img")
+        images = self.soup.find_all("img")
         self.r.images_total = len(images)
         missing_alt = 0
         empty_alt_non_decorative = 0
@@ -1770,9 +1796,13 @@ class PageAnalyzer:
                 if "width" not in style and "height" not in style:
                     missing_dims += 1
 
-            if src and checked < 15:
-                checked += 1
+            if src and checked < MAX_IMAGE_RESOURCE_CHECKS:
+                if src.startswith(("data:", "blob:", "javascript:")):
+                    continue
                 abs_img = urljoin(self.url, src)
+                if not abs_img.startswith(("http://", "https://")):
+                    continue
+                checked += 1
                 status, content_len = self._fetch_resource_info(abs_img)
                 if status >= 400:
                     broken_images += 1
@@ -1808,11 +1838,7 @@ class PageAnalyzer:
                 f"{large_images} шт.", "0 шт.")
 
     def _check_schema(self):
-        # Re-parse for schema (we decomposed scripts above)
-        try:
-            schema_soup = BeautifulSoup(self.response.content, "lxml")
-        except Exception:
-            schema_soup = BeautifulSoup(self.response.content, "html.parser")
+        schema_soup = self.soup
 
         ld_scripts = schema_soup.find_all("script", type="application/ld+json")
         if ld_scripts:
@@ -1902,10 +1928,7 @@ class PageAnalyzer:
         if urlparse(self.url).scheme != "https":
             return
 
-        try:
-            mc_soup = BeautifulSoup(self.response.content, "lxml")
-        except Exception:
-            mc_soup = BeautifulSoup(self.response.content, "html.parser")
+        mc_soup = self.soup
 
         mixed = False
         for tag, attr in [("img", "src"), ("script", "src"), ("link", "href"),
@@ -1942,12 +1965,33 @@ class PageAnalyzer:
                     "lang": hl.get("hreflang", ""),
                     "href": hl.get("href", ""),
                 })
-        elif self.r.has_lang and self.r.lang_value.lower().startswith(("en", "ru", "de", "fr", "es")):
-            self.add_issue("info", "technical", "missing_hreflang",
-                "Не найден hreflang (проверьте, если сайт мультиязычный)")
+            return
+
+        # Снижаем ложные срабатывания: предупреждаем только при признаках мультиязычности.
+        candidate_langs = set()
+        path = urlparse(self.url).path.lower()
+        for code in ("ru", "en", "de", "fr", "es", "it", "pt", "tr", "pl", "uk", "zh", "ja", "ar"):
+            if f"/{code}/" in path or path.startswith(f"/{code}-") or path.endswith(f"-{code}"):
+                candidate_langs.add(code)
+
+        for a in self.soup.find_all("a", href=True):
+            href = a.get("href", "").lower()
+            for code in ("ru", "en", "de", "fr", "es", "it", "pt", "tr", "pl", "uk", "zh", "ja", "ar"):
+                if f"/{code}/" in href:
+                    candidate_langs.add(code)
+            if len(candidate_langs) >= 2:
+                break
+
+        if len(candidate_langs) >= 2:
+            self.add_issue(
+                "info",
+                "technical",
+                "missing_hreflang",
+                "Похоже на мультиязычный сайт, но hreflang не найден",
+            )
 
     def _detect_framework(self):
-        html_str = self.response.text[:5000].lower()
+        html_str = (self.r.raw_html or self.response.text or "")[:5000].lower()
         detected = []
         for name, patterns in JS_FRAMEWORKS.items():
             for pat in patterns:
@@ -1970,10 +2014,7 @@ class PageAnalyzer:
 
     def extract_links(self) -> Tuple[List[str], List[str]]:
         """Extract all links from page for crawler."""
-        try:
-            link_soup = BeautifulSoup(self.response.content, "lxml")
-        except Exception:
-            link_soup = BeautifulSoup(self.response.content, "html.parser")
+        link_soup = self.soup
 
         internal_links: List[str] = []
         external_links: List[str] = []
@@ -2129,25 +2170,36 @@ class SiteAnalyzer:
             if len(urls) > 1
         ]
 
-        # Approximate duplicates (>90%) for non-identical hashes
+        # Approximate duplicates (>90%) for non-identical hashes.
+        # Ограничиваем число сравнений, чтобы не перегружать облачный инстанс.
         text_items = [(u, p.content_text) for u, p in self.result.pages.items() if p.content_text]
-        used_pairs = set()
+        text_items.sort(key=lambda item: len(item[1]), reverse=True)
         similar_map: Dict[str, Set[str]] = defaultdict(set)
+        comparisons = 0
         for i in range(len(text_items)):
             u1, t1 = text_items[i]
             if len(t1) < 300:
                 continue
+            sig1 = set(re.findall(r"[a-zа-я0-9]{4,}", t1[:1200].lower()))
             for j in range(i + 1, len(text_items)):
+                if comparisons >= MAX_SIMILARITY_PAIRS:
+                    break
                 u2, t2 = text_items[j]
-                if (u1, u2) in used_pairs:
+                if len(t2) < 300:
                     continue
-                used_pairs.add((u1, u2))
                 if abs(len(t1) - len(t2)) > max(len(t1), len(t2)) * 0.25:
                     continue
+                sig2 = set(re.findall(r"[a-zа-я0-9]{4,}", t2[:1200].lower()))
+                # Быстрый отсев явно непохожих текстов.
+                if sig1 and sig2 and (len(sig1 & sig2) / max(1, len(sig1 | sig2))) < 0.18:
+                    continue
+                comparisons += 1
                 ratio = SequenceMatcher(None, t1[:4000], t2[:4000]).ratio()
                 if ratio >= 0.9:
                     similar_map[u1].add(u2)
                     similar_map[u2].add(u1)
+            if comparisons >= MAX_SIMILARITY_PAIRS:
+                break
 
         seen = set()
         for url, neighbors in similar_map.items():
@@ -3169,7 +3221,7 @@ class SEOAuditApp:
         lock_acquired = False
         try:
             lock_acquired = guard.lock.acquire(blocking=False)
-            if not lock_acquired and guard.active_session_id and guard.active_session_id != session_id:
+            if not lock_acquired:
                 st.session_state["state"] = "ERROR"
                 st.session_state["error_message"] = ERROR_MESSAGES_RU["busy"]
                 st.rerun()
