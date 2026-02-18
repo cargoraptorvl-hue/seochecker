@@ -57,8 +57,10 @@ MAX_CATEGORY_PENALTY = 30
 SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
 
 # Thresholds
-TITLE_MIN = 30
-TITLE_MAX = 60
+# Title thresholds: Google shows ~55-60 chars, Yandex shows ~65-70.
+# Using 20/70 to cover both engines and reduce false positives.
+TITLE_MIN = 20
+TITLE_MAX = 70
 DESC_MIN = 70
 DESC_MAX = 160
 H1_MAX_LEN = 70
@@ -79,8 +81,10 @@ MAX_EXTERNAL_CHECKS = 200 if IS_RENDER else 400
 MAX_UNCRAWLED_STATUS_CHECKS = 250 if IS_RENDER else 500
 UI_MAX_PAGES_LIMIT = 120 if IS_RENDER else 200
 UI_DEFAULT_MAX_PAGES = 40 if IS_RENDER else 50
-MAX_IMAGE_RESOURCE_CHECKS = 3 if IS_RENDER else 12
-RESOURCE_CHECK_TIMEOUT = 4 if IS_RENDER else 8
+MAX_IMAGE_RESOURCE_CHECKS = 3 if IS_RENDER else 8
+RESOURCE_CHECK_TIMEOUT = 4 if IS_RENDER else 6
+# Global cap on total image/resource HEAD checks across all pages
+MAX_TOTAL_RESOURCE_CHECKS = 60 if IS_RENDER else 200
 MAX_SIMILARITY_PAIRS = 2500 if IS_RENDER else 7000
 
 # Простая авторизация (можно переопределить в Render -> Environment)
@@ -364,11 +368,52 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 @dataclass
 class AuditRuntimeGuard:
-    """Глобальная блокировка, чтобы не запускать несколько тяжёлых аудитов одновременно."""
+    """Timestamp-based guard: no Lock — no deadlock on Streamlit rerun.
 
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    The previous Lock-based approach caused permanent lockout when
+    Streamlit reran the script mid-crawl (Lock.release never called).
+    Now we use a timestamp with automatic expiry.
+    """
+
+    _lock: threading.Lock = field(default_factory=threading.Lock)
     active_session_id: str = ""
     started_at: float = 0.0
+    max_pages_hint: int = 50  # used to compute TTL
+
+    def try_acquire(self, session_id: str, max_pages: int = 50) -> bool:
+        """Try to start an audit. Returns True if acquired."""
+        with self._lock:
+            now = time.time()
+            ttl = max(120, max_pages * 3 + 180)  # generous TTL
+            if self.active_session_id and self.active_session_id != session_id:
+                if (now - self.started_at) < ttl:
+                    return False  # another session is actively crawling
+                # expired — reclaim
+            self.active_session_id = session_id
+            self.started_at = now
+            self.max_pages_hint = max_pages
+            return True
+
+    def release(self, session_id: str) -> None:
+        """Release the audit slot."""
+        with self._lock:
+            if self.active_session_id == session_id:
+                self.active_session_id = ""
+                self.started_at = 0.0
+
+    def is_busy(self, session_id: str) -> bool:
+        """Check if another session is actively auditing."""
+        with self._lock:
+            if not self.active_session_id:
+                return False
+            if self.active_session_id == session_id:
+                return False
+            ttl = max(120, self.max_pages_hint * 3 + 180)
+            if (time.time() - self.started_at) >= ttl:
+                self.active_session_id = ""
+                self.started_at = 0.0
+                return False
+            return True
 
 
 @st.cache_resource(show_spinner=False)
@@ -625,7 +670,7 @@ class CrawlerEngine:
         self.max_workers = MAX_WORKERS
 
         self.visited: Set[str] = set()
-        self.queue: List[Tuple[str, int]] = []
+        self.queue: deque = deque()  # deque for O(1) popleft in BFS
         self.results: Dict[str, PageResult] = {}
         self.all_discovered_links: Set[str] = set()
         self.internal_link_targets: Dict[str, Set[str]] = defaultdict(set)  # target -> set of source pages
@@ -636,6 +681,7 @@ class CrawlerEngine:
         self.raw_url_variants: Dict[str, Set[str]] = defaultdict(set)
         self.resource_info_cache: Dict[str, Tuple[int, int]] = {}
         self.resource_cache_lock = threading.Lock()
+        self._critical_count = 0  # running counter instead of O(N*M) recount
 
         self.session = requests.Session()
         retry = Retry(
@@ -972,7 +1018,7 @@ class CrawlerEngine:
             # Take batch from queue
             batch = []
             while self.queue and len(batch) < self.max_workers and (len(self.results) + len(batch)) < self.max_pages:
-                batch.append(self.queue.pop(0))
+                batch.append(self.queue.popleft())
 
             if not batch:
                 break
@@ -992,6 +1038,10 @@ class CrawlerEngine:
                             page_result.url = source_key
                             self.results[source_key] = page_result
 
+                            # Update running critical counter (O(K) per page, not O(N*M))
+                            if any(i.severity == "critical" for i in page_result.issues):
+                                self._critical_count += 1
+
                             # Report progress
                             if progress_callback:
                                 progress_callback({
@@ -1002,10 +1052,7 @@ class CrawlerEngine:
                                     "pagesScanned": len(self.results),
                                     "totalDiscovered": len(self.visited),
                                     "queueSize": len(self.queue),
-                                    "errorsCount": sum(
-                                        1 for p in self.results.values()
-                                        if any(i.severity == "critical" for i in p.issues)
-                                    ),
+                                    "errorsCount": self._critical_count,
                                 })
 
                             for link in discovered_internal:
@@ -1408,7 +1455,7 @@ class CrawlerEngine:
         # Run all per-page checks
         page_analyzer = PageAnalyzer(
             result.url,
-            resp,
+            raw_bytes,
             soup,
             result,
             self.domain,
@@ -1433,13 +1480,13 @@ class CrawlerEngine:
 class PageAnalyzer:
     """Performs all per-page SEO checks."""
 
-    def __init__(self, url: str, response: requests.Response, soup: BeautifulSoup,
+    def __init__(self, url: str, raw_bytes: bytes, soup: BeautifulSoup,
                  result: PageResult, domain: str, base_origin: str,
                  session: requests.Session, headers_factory,
                  resource_info_cache: Dict[str, Tuple[int, int]],
                  resource_cache_lock: threading.Lock):
         self.url = url
-        self.response = response
+        self.raw_bytes = raw_bytes  # raw HTML bytes — no dependency on response object
         self.soup = soup
         self.r = result
         self.domain = domain
@@ -1698,9 +1745,9 @@ class PageAnalyzer:
 
     def _check_content(self):
         try:
-            clean_soup = BeautifulSoup(self.response.content, "lxml")
+            clean_soup = BeautifulSoup(self.raw_bytes, "lxml")
         except Exception:
-            clean_soup = BeautifulSoup(self.response.content, "html.parser")
+            clean_soup = BeautifulSoup(self.raw_bytes, "html.parser")
 
         # Remove script/style/comment content for word count
         for elem in clean_soup(["script", "style", "noscript"]):
@@ -1723,17 +1770,28 @@ class PageAnalyzer:
         text_len = len(text.encode("utf-8"))
         self.r.text_html_ratio = (text_len / max(1, html_len)) * 100
 
-        # Thin content checks
-        is_blog_like = "/blog" in self.url.lower() or "/news" in self.url.lower()
+        # Thin content checks — skip non-content pages to reduce false positives
+        path_lower = urlparse(self.url).path.lower()
+        is_non_content_page = any(seg in path_lower for seg in [
+            "/contact", "/login", "/register", "/signup", "/auth",
+            "/cart", "/checkout", "/account", "/search", "/404",
+            "/privacy", "/terms", "/legal", "/cookie", "/gdpr",
+            "/tag/", "/category/", "/feed", "/rss",
+        ])
+        is_blog_like = "/blog" in path_lower or "/news" in path_lower
 
-        if self.r.word_count < VERY_THIN_CONTENT_THRESHOLD:
-            self.add_issue("critical", "content", "very_thin_content",
-                f"Очень мало контента: {self.r.word_count} слов",
-                f"{self.r.word_count} слов", f">{THIN_CONTENT_THRESHOLD} слов")
-        elif self.r.word_count < THIN_CONTENT_THRESHOLD and not is_blog_like:
-            self.add_issue("warning", "content", "thin_content",
-                f"Мало контента: {self.r.word_count} слов",
-                f"{self.r.word_count} слов", f">{THIN_CONTENT_THRESHOLD} слов")
+        # Pages with error status codes shouldn't be flagged for thin content
+        is_error_page = self.r.status_code >= 400
+
+        if not is_non_content_page and not is_error_page:
+            if self.r.word_count < VERY_THIN_CONTENT_THRESHOLD:
+                self.add_issue("warning", "content", "very_thin_content",
+                    f"Очень мало контента: {self.r.word_count} слов",
+                    f"{self.r.word_count} слов", f">{THIN_CONTENT_THRESHOLD} слов")
+            elif self.r.word_count < THIN_CONTENT_THRESHOLD and not is_blog_like:
+                self.add_issue("warning", "content", "thin_content",
+                    f"Мало контента: {self.r.word_count} слов",
+                    f"{self.r.word_count} слов", f">{THIN_CONTENT_THRESHOLD} слов")
 
         if self.r.text_html_ratio < TEXT_HTML_RATIO_LOW:
             self.add_issue("info", "content", "low_text_ratio",
@@ -1780,12 +1838,20 @@ class PageAnalyzer:
                 canonical_href, f"https://{parsed_can.netloc}{parsed_can.path}")
 
         # Check self-referencing
-        norm_page = self.url.rstrip("/")
-        norm_can = absolute_canonical.rstrip("/")
+        # Use proper normalization for canonical comparison to avoid false positives
+        # on www/non-www, trailing slash, scheme differences
+        def _norm_for_cmp(u: str) -> str:
+            p = urlparse(u)
+            return urlunparse((p.scheme.lower(), p.netloc.lower().replace("www.", ""),
+                               p.path.rstrip("/") or "/", "", "", ""))
+        norm_page = _norm_for_cmp(self.url)
+        norm_can = _norm_for_cmp(absolute_canonical)
         if norm_can and norm_can != norm_page:
             self.r.canonical_status = "other"
-            self.add_issue("warning", "technical", "canonical_not_self",
-                "Canonical не является self-referencing",
+            # INFO not WARNING: many pages intentionally point canonical elsewhere
+            # (paginated, filtered, language variants)
+            self.add_issue("info", "technical", "canonical_not_self",
+                "Canonical указывает на другой URL (проверьте, что это намеренно)",
                 canonical_href, self.url)
         else:
             self.r.canonical_status = "ok"
@@ -1823,6 +1889,11 @@ class PageAnalyzer:
                 abs_img = urljoin(self.url, src)
                 if not abs_img.startswith(("http://", "https://")):
                     continue
+                # Respect global cap to avoid excessive network calls
+                with self.resource_cache_lock:
+                    total_checked = len(self.resource_info_cache)
+                if total_checked >= MAX_TOTAL_RESOURCE_CHECKS:
+                    break
                 checked += 1
                 status, content_len = self._fetch_resource_info(abs_img)
                 if status >= 400:
@@ -1988,22 +2059,36 @@ class PageAnalyzer:
                 })
             return
 
-        # Снижаем ложные срабатывания: предупреждаем только при признаках мультиязычности.
+        # Stricter multilingual detection to reduce false positives
+        # Only detect if path starts with /xx/ where xx is a 2-letter ISO code
+        import re as _re
         candidate_langs = set()
         path = urlparse(self.url).path.lower()
-        for code in ("ru", "en", "de", "fr", "es", "it", "pt", "tr", "pl", "uk", "zh", "ja", "ar"):
-            if f"/{code}/" in path or path.startswith(f"/{code}-") or path.endswith(f"-{code}"):
-                candidate_langs.add(code)
+        # Check if current page path starts with /xx/
+        lang_prefix_match = _re.match(r"^/([a-z]{2})(?:/|$)", path)
+        if lang_prefix_match:
+            candidate_langs.add(lang_prefix_match.group(1))
 
-        for a in self.soup.find_all("a", href=True):
-            href = a.get("href", "").lower()
-            for code in ("ru", "en", "de", "fr", "es", "it", "pt", "tr", "pl", "uk", "zh", "ja", "ar"):
-                if f"/{code}/" in href:
-                    candidate_langs.add(code)
+        # Check internal links for /xx/ prefixes (limit scan to 50 links)
+        for i, a in enumerate(self.soup.find_all("a", href=True)):
+            if i >= 50:
+                break
+            href = a.get("href", "").strip()
+            if not href or href.startswith(("#", "javascript:", "mailto:")):
+                continue
+            href_path = urlparse(href).path.lower()
+            m = _re.match(r"^/([a-z]{2})(?:/|$)", href_path)
+            if m:
+                candidate_langs.add(m.group(1))
             if len(candidate_langs) >= 2:
                 break
 
-        if len(candidate_langs) >= 2:
+        # Only flag if we found 2+ distinct language-like prefixes
+        # AND they are actual ISO 639-1 codes (not random 2-letter path segments)
+        iso_codes = {"ru", "en", "de", "fr", "es", "it", "pt", "tr", "pl", "uk",
+                     "zh", "ja", "ar", "ko", "nl", "sv", "no", "da", "fi", "cs", "ro", "hu"}
+        real_langs = candidate_langs & iso_codes
+        if len(real_langs) >= 2:
             self.add_issue(
                 "info",
                 "technical",
@@ -2012,7 +2097,7 @@ class PageAnalyzer:
             )
 
     def _detect_framework(self):
-        html_str = (self.r.raw_html or self.response.text or "")[:5000].lower()
+        html_str = (self.r.raw_html or "")[:5000].lower()
         detected = []
         for name, patterns in JS_FRAMEWORKS.items():
             for pat in patterns:
@@ -2192,16 +2277,31 @@ class SiteAnalyzer:
         ]
 
         # Approximate duplicates (>90%) for non-identical hashes.
-        # Ограничиваем число сравнений, чтобы не перегружать облачный инстанс.
-        text_items = [(u, p.content_text) for u, p in self.result.pages.items() if p.content_text]
+        # Skip URLs already covered by exact-hash groups (M6 fix).
+        already_in_exact = set()
+        for group in duplicate_groups:
+            already_in_exact.update(group["urls"])
+
+        text_items = [
+            (u, p.content_text)
+            for u, p in self.result.pages.items()
+            if p.content_text and u not in already_in_exact
+        ]
         text_items.sort(key=lambda item: len(item[1]), reverse=True)
         similar_map: Dict[str, Set[str]] = defaultdict(set)
         comparisons = 0
+
+        # Pre-compute signatures once (not inside inner loop)
+        signatures: Dict[str, Set[str]] = {}
+        for u, t in text_items:
+            if len(t) >= 300:
+                signatures[u] = set(re.findall(r"[a-zа-яё0-9]{4,}", t[:1200].lower()))
+
         for i in range(len(text_items)):
             u1, t1 = text_items[i]
             if len(t1) < 300:
                 continue
-            sig1 = set(re.findall(r"[a-zа-я0-9]{4,}", t1[:1200].lower()))
+            sig1 = signatures.get(u1, set())
             for j in range(i + 1, len(text_items)):
                 if comparisons >= MAX_SIMILARITY_PAIRS:
                     break
@@ -2210,13 +2310,16 @@ class SiteAnalyzer:
                     continue
                 if abs(len(t1) - len(t2)) > max(len(t1), len(t2)) * 0.25:
                     continue
-                sig2 = set(re.findall(r"[a-zа-я0-9]{4,}", t2[:1200].lower()))
-                # Быстрый отсев явно непохожих текстов.
+                sig2 = signatures.get(u2, set())
+                # Fast pre-filter by shingle overlap (Jaccard)
                 if sig1 and sig2 and (len(sig1 & sig2) / max(1, len(sig1 | sig2))) < 0.18:
                     continue
                 comparisons += 1
-                ratio = SequenceMatcher(None, t1[:4000], t2[:4000]).ratio()
-                if ratio >= 0.9:
+                # Use quick_ratio() first as O(1) pre-filter before full O(N²) ratio()
+                sm = SequenceMatcher(None, t1[:2000], t2[:2000])
+                if sm.quick_ratio() < 0.85:
+                    continue
+                if sm.ratio() >= 0.9:
                     similar_map[u1].add(u2)
                     similar_map[u2].add(u1)
             if comparisons >= MAX_SIMILARITY_PAIRS:
@@ -2227,16 +2330,16 @@ class SiteAnalyzer:
             if url in seen:
                 continue
             cluster = {url}
-            queue = [url]
-            while queue:
-                node = queue.pop()
+            queue_sm = [url]
+            while queue_sm:
+                node = queue_sm.pop()
                 if node in seen:
                     continue
                 seen.add(node)
                 cluster.add(node)
                 for nxt in similar_map.get(node, set()):
                     if nxt not in seen:
-                        queue.append(nxt)
+                        queue_sm.append(nxt)
             if len(cluster) > 1:
                 duplicate_groups.append({"urls": sorted(cluster)})
 
@@ -2898,8 +3001,8 @@ def severity_badge(level: str) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def build_pages_dataframe(pages_payload: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
-    """Кэшируемая сборка таблицы всех страниц."""
+def build_pages_dataframe(_audit_id: str, pages_payload: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+    """Кэшируемая сборка таблицы всех страниц. _audit_id is the cheap cache key."""
     canonical_map = {
         "ok": "✅ ОК",
         "missing": "⚠️ Нет",
@@ -2926,8 +3029,8 @@ def build_pages_dataframe(pages_payload: Dict[str, Dict[str, Any]]) -> pd.DataFr
 
 
 @st.cache_data(show_spinner=False)
-def build_issues_dataframe(pages_payload: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
-    """Кэшируемая сборка плоской таблицы ошибок."""
+def build_issues_dataframe(_audit_id: str, pages_payload: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+    """Кэшируемая сборка плоской таблицы ошибок. _audit_id is the cheap cache key."""
     rows = []
     for url, page in pages_payload.items():
         for issue in page.get("issues", []):
@@ -2971,6 +3074,7 @@ class SEOAuditApp:
             "session_id": str(uuid.uuid4()),
             "is_authenticated": False,
             "auth_error": "",
+            "audit_id": "",
             "config": {
                 "url": "",
                 "max_pages": UI_DEFAULT_MAX_PAGES,
@@ -3115,7 +3219,7 @@ class SEOAuditApp:
             )
             cfg["url"] = url_value.strip()
 
-            if audit_guard.lock.locked() and audit_guard.active_session_id and audit_guard.active_session_id != st.session_state["session_id"]:
+            if audit_guard.is_busy(st.session_state["session_id"]):
                 st.info("⏳ Сейчас выполняется аудит другим пользователем. Запуск временно недоступен.")
 
             if st.button("🚀 Запустить аудит", type="primary"):
@@ -3212,7 +3316,7 @@ class SEOAuditApp:
 
         guard = get_runtime_guard()
         session_id = st.session_state["session_id"]
-        if guard.lock.locked() and guard.active_session_id and guard.active_session_id != session_id:
+        if guard.is_busy(session_id):
             st.session_state["state"] = "ERROR"
             st.session_state["error_message"] = ERROR_MESSAGES_RU["busy"]
             st.rerun()
@@ -3235,8 +3339,7 @@ class SEOAuditApp:
 
         cfg["max_pages"] = max(10, min(int(cfg.get("max_pages", UI_DEFAULT_MAX_PAGES)), UI_MAX_PAGES_LIMIT))
 
-        build_pages_dataframe.clear()
-        build_issues_dataframe.clear()
+        st.session_state["audit_id"] = str(uuid.uuid4())[:8]
         st.session_state["scan_log"] = []
         st.session_state["scan_stats"] = {"progress": 0.0, "found": 0, "done": 0, "queue": 0, "errors": 0, "elapsed": 0.0}
         st.session_state["results"] = None
@@ -3364,21 +3467,14 @@ class SEOAuditApp:
 
         guard = get_runtime_guard()
         session_id = st.session_state["session_id"]
-        if guard.lock.locked() and guard.active_session_id and guard.active_session_id != session_id:
+        max_pages_cfg = int(cfg["max_pages"])
+
+        if not guard.try_acquire(session_id, max_pages_cfg):
             st.session_state["state"] = "ERROR"
             st.session_state["error_message"] = ERROR_MESSAGES_RU["busy"]
             st.rerun()
 
-        lock_acquired = False
         try:
-            lock_acquired = guard.lock.acquire(blocking=False)
-            if not lock_acquired:
-                st.session_state["state"] = "ERROR"
-                st.session_state["error_message"] = ERROR_MESSAGES_RU["busy"]
-                st.rerun()
-
-            guard.active_session_id = session_id
-            guard.started_at = time.time()
             crawler = CrawlerEngine(
                 start_url=cfg["url"],
                 max_pages=int(cfg["max_pages"]),
@@ -3392,6 +3488,10 @@ class SEOAuditApp:
                 st.session_state["state"] = "ERROR"
                 st.session_state["error_message"] = ERROR_MESSAGES_RU["no_pages"]
             else:
+                # Strip heavy fields to avoid OOM when Streamlit serializes session state
+                for page in result.pages.values():
+                    page.raw_html = ""
+                    page.content_text = page.content_text[:2000] if page.content_text else ""
                 st.session_state["results"] = result
                 st.session_state["state"] = "RESULTS"
         except requests.exceptions.Timeout:
@@ -3408,18 +3508,16 @@ class SEOAuditApp:
             st.session_state["state"] = "ERROR"
             st.session_state["error_message"] = f"❌ Ошибка аудита: {str(exc)[:180]}"
         finally:
-            if lock_acquired:
-                guard.active_session_id = ""
-                guard.started_at = 0.0
-                guard.lock.release()
+            guard.release(session_id)
 
         st.rerun()
 
     def render_results(self) -> None:
         result: SiteAuditResult = st.session_state["results"]
+        audit_id = st.session_state.get("audit_id", "default")
         pages_payload = {url: page.to_dict() for url, page in result.pages.items()}
-        pages_df = build_pages_dataframe(pages_payload)
-        issues_df = build_issues_dataframe(pages_payload)
+        pages_df = build_pages_dataframe(audit_id, pages_payload)
+        issues_df = build_issues_dataframe(audit_id, pages_payload)
 
         tab_overview, tab_errors, tab_all_pages, tab_duplicates, tab_plan, tab_tech = st.tabs(
             ["📊 Обзор", "🔴 Ошибки", "📄 Все стр.", "📝 Дубли", "🎯 План", "🔧 Тех."]
