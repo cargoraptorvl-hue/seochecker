@@ -1344,30 +1344,30 @@ class CrawlerEngine:
         too_large = False
         content_len_header = resp.headers.get("Content-Length", "").strip()
         declared_size = int(content_len_header) if content_len_header.isdigit() else 0
-        if declared_size > MAX_HTML_SIZE:
-            too_large = True
-        else:
-            try:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    if not chunk:
-                        continue
-                    loaded_size += len(chunk)
-                    if loaded_size > MAX_HTML_SIZE:
-                        too_large = True
-                        break
-                    raw_chunks.append(chunk)
-            except Exception:
-                pass
+        # Always load at least LINK_EXTRACT_SIZE to discover links for BFS,
+        # even if page exceeds MAX_HTML_SIZE.
+        LINK_EXTRACT_SIZE = MAX_HTML_SIZE  # load up to limit regardless
+        try:
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                loaded_size += len(chunk)
+                raw_chunks.append(chunk)
+                if loaded_size > MAX_HTML_SIZE:
+                    too_large = True
+                    break
+        except Exception:
+            pass
 
         raw_bytes = b"".join(raw_chunks)
-        result.content_length = len(raw_bytes) if raw_bytes else declared_size
+        result.content_length = loaded_size if loaded_size > 0 else declared_size
 
         try:
             resp.close()
         except Exception:
             pass
 
-        if result.content_length == 0:
+        if result.content_length == 0 and len(raw_bytes) == 0:
             result.issues.append(PageIssue(
                 "critical",
                 "technical",
@@ -1378,7 +1378,7 @@ class CrawlerEngine:
             ))
             return result, [], []
         if too_large:
-            page_kb = max(result.content_length, declared_size) // 1024
+            page_kb = max(loaded_size, declared_size) // 1024
             result.issues.append(PageIssue(
                 "warning",
                 "technical",
@@ -1387,7 +1387,7 @@ class CrawlerEngine:
                 f"{page_kb}KB",
                 f"<{MAX_HTML_SIZE // 1024}KB",
             ))
-            return result, [], []
+            # Do NOT return early — continue to parse links from loaded portion
 
         try:
             encoding = resp.encoding or "utf-8"
