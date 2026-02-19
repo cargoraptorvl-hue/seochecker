@@ -247,6 +247,36 @@ RECOMMENDATIONS_RU = {
         "fix": "Добавить директиву Clean-param в robots.txt для параметров utm_*, sort, filter и т.д.",
         "effort": "quick",
     },
+    "dead_end_pages": {
+        "title": "Исправить {count} тупиковых страниц без исходящих ссылок",
+        "impact": "Тупиковые страницы не передают ссылочный вес дальше по сайту, ухудшая распределение PageRank и индексацию глубоких страниц.",
+        "fix": "Добавить блоки «Похожие статьи», хлебные крошки или навигацию для передачи ссылочного веса.",
+        "effort": "medium",
+    },
+    "low_inlinks": {
+        "title": "Усилить перелинковку для {count} слабо связанных страниц",
+        "impact": "Страницы с <2 входящими ссылками получают мало ссылочного веса и хуже индексируются Google и Яндексом.",
+        "fix": "Добавить ссылки на эти страницы из тематически связанных разделов, блога или навигации.",
+        "effort": "medium",
+    },
+    "canonical_chain": {
+        "title": "Устранить {count} цепочек каноникалов",
+        "impact": "Цепочки canonical A→B→C замедляют передачу сигналов и могут игнорироваться поисковиками.",
+        "fix": "Каждая страница должна указывать canonical напрямую на конечный URL, без промежуточных звеньев.",
+        "effort": "quick",
+    },
+    "canonical_sitemap_conflict": {
+        "title": "Исправить {count} конфликтов canonical/sitemap",
+        "impact": "Страница включена в sitemap, но canonical указывает на другой URL — противоречивый сигнал для поисковиков.",
+        "fix": "Либо убрать страницу из sitemap, либо исправить canonical на self-referencing.",
+        "effort": "quick",
+    },
+    "schema_incomplete": {
+        "title": "Заполнить обязательные поля Schema.org для {count} страниц",
+        "impact": "Неполная Schema-разметка не даёт rich-results в выдаче Google. Яндекс также использует Schema для сниппетов.",
+        "fix": "Добавить обязательные поля (@type-specific) в JSON-LD разметку.",
+        "effort": "medium",
+    },
 }
 
 ERROR_MESSAGES_RU = {
@@ -492,6 +522,9 @@ class PageResult:
     broken_links_on_page: List[str] = field(default_factory=list)
     broken_internal_links: int = 0
     broken_external_links: int = 0
+    inlink_count: int = 0          # incoming internal links
+    is_dead_end: bool = False       # no outgoing internal links
+    internal_pagerank: float = 0.0  # simplified PageRank score
     images_total: int = 0
     images_missing_alt: int = 0
     images_empty_alt: int = 0
@@ -628,6 +661,16 @@ class SiteAuditResult:
     thin_content_clusters: List[Dict[str, Any]] = field(default_factory=list)
     sitemap_vs_crawled: Dict[str, List[str]] = field(default_factory=dict)
     no_structured_data: bool = False
+    dead_end_pages: List[str] = field(default_factory=list)
+    # Interlinking stats
+    avg_inlinks: float = 0.0
+    max_inlinks: int = 0
+    median_inlinks: float = 0.0
+    pages_low_inlinks: List[str] = field(default_factory=list)  # <2 inlinks (excl. homepage)
+    canonical_chains: List[Dict] = field(default_factory=list)
+    canonical_sitemap_conflicts: List[Dict] = field(default_factory=list)
+    schema_validation_issues: List[Dict] = field(default_factory=list)
+    score_explanation: Dict[str, Any] = field(default_factory=dict)
     # Scoring
     health_score: int = 0
     category_scores: Dict[str, int] = field(default_factory=dict)
@@ -2216,6 +2259,11 @@ class SiteAnalyzer:
         self._mark_robots_linked_blocked()
         self._check_no_structured_data()
         self._compare_sitemap()
+        self._compute_interlinking_stats()
+        self._compute_internal_pagerank()
+        self._detect_canonical_chains()
+        self._detect_canonical_sitemap_conflicts()
+        self._validate_schema_markup()
         self._compute_status_distribution()
         self._compute_issue_stats()
         self._detect_frameworks()
@@ -2500,6 +2548,207 @@ class SiteAnalyzer:
             "overlap": len(sitemap_normed & crawled_normed),
         }
 
+    # === TOP1: Interlinking stats (inlink count, dead-ends, click depth) ===
+    def _compute_interlinking_stats(self):
+        base_norm = self.normalize_url(self.result.base_url)
+        inlink_counts: Dict[str, int] = {}
+
+        for url in self.result.pages:
+            sources = self.link_targets.get(url, set())
+            count = len(sources)
+            inlink_counts[url] = count
+            self.result.pages[url].inlink_count = count
+
+        # Dead-end pages (no outgoing internal links)
+        for url, page in self.result.pages.items():
+            outgoing = self.outgoing_links.get(url, {})
+            internal_out = outgoing.get("internal", set())
+            if len(internal_out) == 0 and url != base_norm:
+                page.is_dead_end = True
+                self.result.dead_end_pages.append(url)
+                page.issues.append(PageIssue(
+                    "warning", "links", "dead_end_page",
+                    "Тупиковая страница: нет исходящих внутренних ссылок",
+                    "0 ссылок", ">0 ссылок"))
+
+        # Stats
+        counts = [c for u, c in inlink_counts.items() if u != base_norm]
+        if counts:
+            self.result.avg_inlinks = sum(counts) / len(counts)
+            self.result.max_inlinks = max(counts)
+            sorted_c = sorted(counts)
+            mid = len(sorted_c) // 2
+            self.result.median_inlinks = (sorted_c[mid] + sorted_c[~mid]) / 2
+
+        # Pages with critically low inlinks (<2, excl. homepage)
+        for url, count in inlink_counts.items():
+            if url == base_norm:
+                continue
+            if count < 2:
+                self.result.pages_low_inlinks.append(url)
+                if count == 0:
+                    pass  # already handled by _find_zero_inlinks
+                else:
+                    self.result.pages[url].issues.append(PageIssue(
+                        "info", "links", "low_inlinks",
+                        f"Мало входящих ссылок: {count} (рекомендуется ≥3)",
+                        str(count), "≥3"))
+
+    # === TOP2: Internal PageRank ===
+    def _compute_internal_pagerank(self):
+        """Simplified PageRank to show link equity distribution."""
+        pages = list(self.result.pages.keys())
+        if len(pages) < 2:
+            return
+
+        n = len(pages)
+        idx = {url: i for i, url in enumerate(pages)}
+        damping = 0.85
+        scores = [1.0 / n] * n
+
+        # Build outlink map: page -> list of internal pages it links to
+        out_targets: List[List[int]] = [[] for _ in range(n)]
+        for url in pages:
+            outgoing = self.outgoing_links.get(url, {})
+            for target in outgoing.get("internal", set()):
+                if target in idx:
+                    out_targets[idx[url]].append(idx[target])
+
+        # 20 iterations is sufficient for convergence on small sites
+        for _ in range(20):
+            new_scores = [(1 - damping) / n] * n
+            for i in range(n):
+                if not out_targets[i]:
+                    # Distribute dead-end "leaked" rank equally
+                    share = damping * scores[i] / n
+                    for j in range(n):
+                        new_scores[j] += share
+                else:
+                    share = damping * scores[i] / len(out_targets[i])
+                    for j in out_targets[i]:
+                        new_scores[j] += share
+            scores = new_scores
+
+        # Normalize to 0-100 scale
+        max_score = max(scores) if scores else 1
+        for i, url in enumerate(pages):
+            self.result.pages[url].internal_pagerank = round(
+                (scores[i] / max(max_score, 1e-10)) * 100, 1)
+
+    # === TOP5: Canonical chain detection ===
+    def _detect_canonical_chains(self):
+        """Detect A->B->C canonical chains (A's canonical points to B, B's canonical points to C)."""
+        canonical_map: Dict[str, str] = {}
+        for url, page in self.result.pages.items():
+            if page.canonical and page.canonical_status == "other":
+                canonical_map[url] = self.normalize_url(page.canonical)
+
+        for url, target in canonical_map.items():
+            if target in canonical_map and canonical_map[target] != target:
+                chain = [url, target, canonical_map[target]]
+                # Follow further
+                seen = set(chain)
+                current = canonical_map[target]
+                while current in canonical_map and canonical_map[current] not in seen:
+                    current = canonical_map[current]
+                    chain.append(current)
+                    seen.add(current)
+
+                self.result.canonical_chains.append({
+                    "chain": chain,
+                    "length": len(chain),
+                })
+                self.result.pages[url].issues.append(PageIssue(
+                    "warning", "technical", "canonical_chain",
+                    f"Цепочка каноникалов: {len(chain)} хопов",
+                    " → ".join(c.split("/")[-1] or "/" for c in chain[:4]),
+                    "Прямой canonical на конечную страницу"))
+
+    # === TOP5: Canonical vs sitemap conflicts ===
+    def _detect_canonical_sitemap_conflicts(self):
+        """Detect pages in sitemap whose canonical points to a different URL."""
+        sitemap_normed = set()
+        for u in self.sitemap_urls:
+            sitemap_normed.add(self.normalize_url(u))
+
+        for url, page in self.result.pages.items():
+            if url not in sitemap_normed:
+                continue
+            if not page.canonical or page.canonical_status != "other":
+                continue
+            canonical_norm = self.normalize_url(page.canonical)
+            if canonical_norm != url:
+                self.result.canonical_sitemap_conflicts.append({
+                    "url": url,
+                    "canonical": page.canonical,
+                    "canonicalNorm": canonical_norm,
+                })
+                page.issues.append(PageIssue(
+                    "warning", "technical", "canonical_sitemap_conflict",
+                    "Страница в sitemap, но canonical указывает на другой URL",
+                    page.canonical[:80], "canonical = URL страницы"))
+
+    # === TOP4: Schema/JSON-LD validation ===
+    def _validate_schema_markup(self):
+        """Validate required fields in JSON-LD/Schema markup for each type."""
+        REQUIRED_FIELDS = {
+            "Article": ["headline", "author", "datePublished"],
+            "NewsArticle": ["headline", "author", "datePublished"],
+            "BlogPosting": ["headline", "author", "datePublished"],
+            "Product": ["name", "offers"],
+            "LocalBusiness": ["name", "address"],
+            "Organization": ["name", "url"],
+            "FAQPage": ["mainEntity"],
+            "BreadcrumbList": ["itemListElement"],
+            "WebSite": ["name", "url"],
+            "Event": ["name", "startDate", "location"],
+        }
+
+        for url, page in self.result.pages.items():
+            if not page.has_schema:
+                continue
+            # Parse JSON-LD from raw HTML
+            html_text = page.raw_html
+            if not html_text:
+                continue
+            try:
+                soup_local = BeautifulSoup(html_text[:50000], "lxml")
+            except Exception:
+                continue
+
+            for script in soup_local.find_all("script", type="application/ld+json"):
+                try:
+                    import json
+                    data = json.loads(script.string or "")
+                    items = data if isinstance(data, list) else [data]
+                    for item in items:
+                        schema_type = item.get("@type", "")
+                        if isinstance(schema_type, list):
+                            schema_type = schema_type[0] if schema_type else ""
+                        required = REQUIRED_FIELDS.get(schema_type, [])
+                        missing = [f for f in required if f not in item or not item[f]]
+                        if missing:
+                            self.result.schema_validation_issues.append({
+                                "url": url,
+                                "type": schema_type,
+                                "missing": missing,
+                            })
+                            page.issues.append(PageIssue(
+                                "warning", "structured_data", "schema_incomplete",
+                                f"Schema {schema_type}: не заполнены обязательные поля",
+                                ", ".join(missing),
+                                "Все обязательные поля заполнены"))
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    self.result.schema_validation_issues.append({
+                        "url": url,
+                        "type": "JSON-LD",
+                        "missing": ["valid_json"],
+                    })
+                    page.issues.append(PageIssue(
+                        "warning", "structured_data", "schema_invalid_json",
+                        "Невалидный JSON-LD разметки Schema.org",
+                        "Ошибка парсинга", "Валидный JSON"))
+
     def _compute_status_distribution(self):
         codes: Dict[str, int] = defaultdict(int)
         for page in self.result.pages.values():
@@ -2546,36 +2795,56 @@ class ReportGenerator:
         if not self.result.pages:
             return
 
-        # Category scores + cap category penalty to 30 as requested
+        # Category config: issue_categories, weight in final score
+        # Weights reflect actual SEO impact:
+        #   technical/links are most important for crawlability/indexing
+        #   content directly affects rankings
+        #   images/structured_data are secondary signals
         categories = {
-            "technical": ["technical", "security"],
-            "content": ["content"],
-            "images": ["images"],
-            "links": ["links"],
-            "structured_data": ["structured_data"],
+            "technical": {"keys": ["technical", "security"], "weight": 0.30},
+            "content":   {"keys": ["content"],              "weight": 0.25},
+            "links":     {"keys": ["links"],                "weight": 0.25},
+            "images":    {"keys": ["images"],               "weight": 0.10},
+            "structured_data": {"keys": ["structured_data"], "weight": 0.10},
         }
 
         pages_count = max(1, self.result.total_scanned)
         category_penalties: Dict[str, float] = {}
-        for cat_name, cat_keys in categories.items():
+        category_raw_penalties: Dict[str, int] = {}
+        for cat_name, cat_cfg in categories.items():
             cat_penalty = 0
             for page in self.result.pages.values():
                 for issue in page.issues:
-                    if issue.category in cat_keys:
+                    if issue.category in cat_cfg["keys"]:
                         cat_penalty += PENALTY_WEIGHTS.get(issue.severity, 0)
-            # Нормализуем к размеру сайта, чтобы крупные сайты не падали в 0 автоматически.
+            category_raw_penalties[cat_name] = cat_penalty
+            # Normalize to site size, cap at MAX_CATEGORY_PENALTY
             normalized = min(MAX_CATEGORY_PENALTY, (cat_penalty / pages_count) * 6)
             category_penalties[cat_name] = normalized
             cat_score = max(0, int(100 - (normalized / MAX_CATEGORY_PENALTY) * 100))
             self.result.category_scores[cat_name] = cat_score
 
-        # Итоговый score считаем как усреднение категорий после cap,
-        # иначе крупные сайты всегда получают 0 даже при умеренных проблемах.
+        # Weighted average instead of simple average
         if self.result.category_scores:
-            avg_score = sum(self.result.category_scores.values()) / len(self.result.category_scores)
-            self.result.health_score = int(max(0, min(100, round(avg_score))))
+            weighted_sum = 0.0
+            total_weight = 0.0
+            for cat_name, cat_cfg in categories.items():
+                score = self.result.category_scores.get(cat_name, 100)
+                weighted_sum += score * cat_cfg["weight"]
+                total_weight += cat_cfg["weight"]
+            self.result.health_score = int(max(0, min(100, round(weighted_sum / max(total_weight, 0.01)))))
         else:
             self.result.health_score = 0
+
+        # Score explanation for transparency
+        self.result.score_explanation = {
+            "formula": "weighted_average(category_scores * weights)",
+            "weights": {k: v["weight"] for k, v in categories.items()},
+            "category_scores": dict(self.result.category_scores),
+            "category_raw_penalties": category_raw_penalties,
+            "pages_count": pages_count,
+            "health_score": self.result.health_score,
+        }
 
     def generate_recommendations(self):
         """Group issues into actionable recommendations."""
@@ -2755,6 +3024,81 @@ class ReportGenerator:
                 "count": 0,
             })
 
+        # Dead-end pages
+        if self.result.dead_end_pages:
+            count = len(self.result.dead_end_pages)
+            template = RECOMMENDATIONS_RU["dead_end_pages"]
+            recs.append({
+                "key": "dead_end_pages",
+                "title": template["title"].format(count=count),
+                "impact": template["impact"],
+                "fix": template["fix"],
+                "effort": template["effort"],
+                "severity": "warning",
+                "urls": self.result.dead_end_pages[:20],
+                "count": count,
+            })
+
+        # Low inlinks
+        if self.result.pages_low_inlinks:
+            count = len(self.result.pages_low_inlinks)
+            template = RECOMMENDATIONS_RU["low_inlinks"]
+            recs.append({
+                "key": "low_inlinks",
+                "title": template["title"].format(count=count),
+                "impact": template["impact"],
+                "fix": template["fix"],
+                "effort": template["effort"],
+                "severity": "warning",
+                "urls": self.result.pages_low_inlinks[:20],
+                "count": count,
+            })
+
+        # Canonical chains
+        if self.result.canonical_chains:
+            count = len(self.result.canonical_chains)
+            template = RECOMMENDATIONS_RU["canonical_chain"]
+            recs.append({
+                "key": "canonical_chain",
+                "title": template["title"].format(count=count),
+                "impact": template["impact"],
+                "fix": template["fix"],
+                "effort": template["effort"],
+                "severity": "warning",
+                "urls": [c["chain"][0] for c in self.result.canonical_chains[:20]],
+                "count": count,
+            })
+
+        # Canonical-sitemap conflicts
+        if self.result.canonical_sitemap_conflicts:
+            count = len(self.result.canonical_sitemap_conflicts)
+            template = RECOMMENDATIONS_RU["canonical_sitemap_conflict"]
+            recs.append({
+                "key": "canonical_sitemap_conflict",
+                "title": template["title"].format(count=count),
+                "impact": template["impact"],
+                "fix": template["fix"],
+                "effort": template["effort"],
+                "severity": "warning",
+                "urls": [c["url"] for c in self.result.canonical_sitemap_conflicts[:20]],
+                "count": count,
+            })
+
+        # Schema validation
+        if self.result.schema_validation_issues:
+            count = len(set(i["url"] for i in self.result.schema_validation_issues))
+            template = RECOMMENDATIONS_RU["schema_incomplete"]
+            recs.append({
+                "key": "schema_incomplete",
+                "title": template["title"].format(count=count),
+                "impact": template["impact"],
+                "fix": template["fix"],
+                "effort": template["effort"],
+                "severity": "warning",
+                "urls": list(set(i["url"] for i in self.result.schema_validation_issues))[:20],
+                "count": count,
+            })
+
         # Sort by severity
         recs.sort(key=lambda x: SEVERITY_ORDER.get(x["severity"], 2))
         self.result.recommendations = recs
@@ -2799,6 +3143,9 @@ class ReportGenerator:
                     "Картинки без ALT": page.images_missing_alt,
                     "TTFB (сек)": round(page.ttfb, 2),
                     "Canonical": page.canonical_status,
+                    "Вх. ссылок": page.inlink_count,
+                    "PageRank": page.internal_pagerank,
+                    "Тупик": "Да" if page.is_dead_end else "",
                     "Ошибок": len(page.issues),
                 })
             pd.DataFrame(pages_data).to_excel(writer, sheet_name="Все страницы", index=False)
@@ -3845,16 +4192,79 @@ class SEOAuditApp:
         else:
             st.success("Явные признаки JS-рендеринга не обнаружены.")
 
+        st.markdown("### Перелинковка и ссылочная структура")
+        il_c1, il_c2, il_c3, il_c4 = st.columns(4)
+        il_c1.metric("Ср. вх. ссылок", f"{result.avg_inlinks:.1f}")
+        il_c2.metric("Макс. вх. ссылок", str(result.max_inlinks))
+        il_c3.metric("Тупиковых стр.", str(len(result.dead_end_pages)))
+        il_c4.metric("Слабо связанных", str(len(result.pages_low_inlinks)))
+
+        # Top pages by internal PageRank
+        pr_pages = sorted(result.pages.values(), key=lambda p: p.internal_pagerank, reverse=True)
+        if pr_pages:
+            with st.expander("Топ страниц по внутреннему PageRank"):
+                pr_data = []
+                for p in pr_pages[:20]:
+                    pr_data.append({
+                        "URL": p.url,
+                        "PageRank": p.internal_pagerank,
+                        "Вх. ссылок": p.inlink_count,
+                        "Тупик": "Да" if p.is_dead_end else "",
+                    })
+                st.dataframe(pd.DataFrame(pr_data), use_container_width=True, hide_index=True)
+
+        if result.dead_end_pages:
+            with st.expander(f"Тупиковые страницы ({len(result.dead_end_pages)})"):
+                for url in result.dead_end_pages[:50]:
+                    st.write(f"- {url}")
+
+        if result.pages_low_inlinks:
+            with st.expander(f"Страницы с <2 входящими ссылками ({len(result.pages_low_inlinks)})"):
+                for url in result.pages_low_inlinks[:50]:
+                    inl = result.pages[url].inlink_count if url in result.pages else 0
+                    st.write(f"- {url} ({inl} ссылок)")
+
+        # Score explanation
+        if result.score_explanation:
+            with st.expander("Как рассчитан итоговый балл"):
+                expl = result.score_explanation
+                weights = expl.get("weights", {})
+                cat_scores = expl.get("category_scores", {})
+                cat_names_ru = {"technical": "Техника", "content": "Контент", "links": "Ссылки",
+                               "images": "Картинки", "structured_data": "Разметка"}
+                st.write("**Формула:** взвешенное среднее категорий")
+                rows = []
+                for cat, weight in weights.items():
+                    rows.append({
+                        "Категория": cat_names_ru.get(cat, cat),
+                        "Балл": cat_scores.get(cat, 0),
+                        "Вес": f"{weight:.0%}",
+                        "Вклад": f"{cat_scores.get(cat, 0) * weight:.1f}",
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.write(f"**Итого: {expl.get('health_score', 0)}/100**")
+
         st.markdown("### Дополнительно")
         st.write(f"- llms.txt: {'✅ найден' if result.has_llms_txt else '❌ не найден'}")
-        st.write(f"- URL, закрытые robots.txt, но найденные во внутренних ссылках: {len(result.robots_linked_blocked)}")
-        st.write(f"- Страницы без входящих внутренних ссылок: {len(result.zero_inlink_pages)}")
-        st.write(f"- Noindex-страницы с входящими внутренними ссылками: {len(result.noindex_linked_pages)}")
+        st.write(f"- URL, закрытые robots.txt: {len(result.robots_linked_blocked)}")
+        st.write(f"- Страницы без входящих ссылок: {len(result.zero_inlink_pages)}")
+        st.write(f"- Noindex с входящими ссылками: {len(result.noindex_linked_pages)}")
         st.write(f"- Кластеры thin content: {len(result.thin_content_clusters)}")
+        st.write(f"- Цепочки canonical: {len(result.canonical_chains)}")
+        st.write(f"- Конфликты canonical/sitemap: {len(result.canonical_sitemap_conflicts)}")
+        st.write(f"- Проблемы Schema-разметки: {len(result.schema_validation_issues)}")
         if result.robots_linked_blocked:
-            with st.expander("Показать URL, закрытые robots.txt, но найденные во внутренних ссылках"):
+            with st.expander("URL, закрытые robots.txt, но найденные во внутренних ссылках"):
                 for url in result.robots_linked_blocked[:200]:
                     st.write(f"- {url}")
+        if result.canonical_chains:
+            with st.expander(f"Цепочки canonical ({len(result.canonical_chains)})"):
+                for chain in result.canonical_chains[:20]:
+                    st.write(f"- {' → '.join(chain['chain'][:5])}")
+        if result.canonical_sitemap_conflicts:
+            with st.expander(f"Конфликты canonical/sitemap ({len(result.canonical_sitemap_conflicts)})"):
+                for conflict in result.canonical_sitemap_conflicts[:20]:
+                    st.write(f"- {conflict['url']} → canonical: {conflict['canonical']}")
 
     def render_error_screen(self) -> None:
         st.error(st.session_state.get("error_message", "Неизвестная ошибка."))
